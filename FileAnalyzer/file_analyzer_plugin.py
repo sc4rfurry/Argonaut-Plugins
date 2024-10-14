@@ -1,7 +1,12 @@
+# /usr/bin/env python3
+# -*- coding: utf-8 -*-
 from argonaut.plugins import Plugin, PluginMetadata, PluginContext
 from typing import Dict, Any, List
 import os
 import re
+import asyncio
+import platform
+from pathlib import Path
 
 
 class FileAnalyzerPlugin(Plugin):
@@ -9,11 +14,19 @@ class FileAnalyzerPlugin(Plugin):
     def metadata(self) -> PluginMetadata:
         return PluginMetadata(
             name="file_analyzer",
-            version="1.2.0",
-            description="A plugin for analyzing files and performing text operations. (A practical example of how to create plugins for Argonaut)",
+            version="1.6.0",
+            description="A cross-platform plugin for analyzing and modifying text files and folders.",
             author="sc4rfurry",
             website="https://github.com/sc4rfurry/Argonaut-Plugins",
-            tags=["file", "analysis", "text"],
+            tags=[
+                "file",
+                "folder",
+                "analysis",
+                "text",
+                "search",
+                "replace",
+                "cross-platform",
+            ],
         )
 
     @property
@@ -23,105 +36,208 @@ class FileAnalyzerPlugin(Plugin):
     @property
     def banner(self) -> str:
         return r"""
-    ______ _ _        ___              _                    
+     ______ _ _        ___              _                    
     |  ____(_) |      / _ \            | |                   
     | |__   _| | ___ / /_\ \_ __   __ _| |_   _ _______ _ __ 
     |  __| | | |/ _ \|  _  | '_ \ / _` | | | | |_  / _ \ '__|
     | |    | | |  __/| | | | | | | (_| | | |_| |/ /  __/ |   
     |_|    |_|_|\___\\_| |_/_| |_|\__,_|_|\__, /___\___|_|   
                                            __/ |             
-                                          |___/              
+                                          |___/   A cross-platform file analysis plugin..!           
     """
 
     def initialize(self, context: PluginContext):
         self.context = context
-        analyze_cmd = context.parser.add_subcommand("analyze", help="Analyze files")
-        analyze_cmd.add("files", nargs="+", help="Files to analyze")
-        analyze_cmd.add("--count", choices=["words", "lines", "chars"], help="Count words, lines, or characters")
-        analyze_cmd.add("--search", help="Search for a specific term in the files")
-        analyze_cmd.add("--replace", nargs=2, metavar=('SEARCH', 'REPLACE'), help="Replace SEARCH with REPLACE")
+        self.logger = context.logger
+        self.verbose = False
+        self.quiet = False
+        analyze_cmd = context.parser.add_subcommand(
+            "analyze", help="Analyze files and folders"
+        )
+        analyze_cmd.add("--files", "-f", nargs="+", help="Files to analyze")
+        analyze_cmd.add("--directory", "-d", help="Directory to analyze")
+        analyze_cmd.add(
+            "--count",
+            choices=["words", "lines", "chars"],
+            help="Count words, lines, or characters",
+        )
+        analyze_cmd.add("--search", help="Search for a specific term (regex supported)")
+        analyze_cmd.add(
+            "--replace",
+            nargs=2,
+            metavar=("SEARCH", "REPLACE"),
+            help="Replace text (regex supported)",
+        )
+        analyze_cmd.add(
+            "--recursive", "-r", action="store_true", help="Analyze folders recursively"
+        )
+        analyze_cmd.add(
+            "--async", action="store_true", help="Run the analysis asynchronously"
+        )
         analyze_cmd.add("--verbose", action="store_true", help="Enable verbose output")
-        analyze_cmd.add("--quiet", action="store_true", help="Run in quiet mode (minimal output)")
+        analyze_cmd.add(
+            "--quiet", action="store_true", help="Run in quiet mode (minimal output)"
+        )
+        analyze_cmd.add(
+            "--file-type", help="Filter files by extension (e.g., .txt, .py)"
+        )
+        analyze_cmd.add(
+            "--size-limit",
+            type=int,
+            help="Limit analysis to files smaller than SIZE in bytes",
+        )
 
         self.register_hook("before_analyze", self.before_analyze_callback)
+        self.show_banner()
 
     def execute(self, args: Dict[str, Any]) -> Any:
-        if "files" not in args or not args["files"]:
-            return "Error: No files specified for analysis."
+        self.verbose = args.get("verbose", False)
+        self.quiet = args.get("quiet", False)
+        if not args.get("files") and not args.get("directory"):
+            return "Error: No files or directory specified for analysis."
 
         self.execute_hook("before_analyze", args)
-        return self.analyze_files(args)
+        return self.analyze_targets(args)
+
+    async def execute_async(self, args: Dict[str, Any]) -> Any:
+        self.logger.info("Executing File Analyzer plugin asynchronously")
+        return await self.analyze_targets_async(args)
 
     def before_analyze_callback(self, args: Dict[str, Any]):
-        self.log("Starting file analysis", "verbose")
+        self.log("Starting file/folder analysis", "verbose")
 
-    def analyze_files(self, args: Dict[str, Any]) -> str:
+    def analyze_targets(self, args: Dict[str, Any]) -> str:
         results = []
-        files = args.get("files", [])
-        if isinstance(files, str):
-            files = [files]
+        if args.get("files"):
+            for file_path in args["files"]:
+                path = Path(file_path).resolve()
+                if path.is_file():
+                    results.append(self.process_file(path, args))
+                else:
+                    results.append(f"Error: Invalid file path - {path}")
 
-        for file_path in files:
-            result = self.analyze_single_file(file_path, args)
-            if result:
-                results.append(result)
+        if args.get("directory"):
+            dir_path = Path(args["directory"]).resolve()
+            if dir_path.is_dir():
+                results.extend(self.process_directory(dir_path, args))
+            else:
+                results.append(f"Error: Invalid directory path - {dir_path}")
 
-        return "\n".join(results)
+        return "\n\n".join(filter(None, results))
 
-    def analyze_single_file(self, file_path: str, args: Dict[str, Any]) -> str:
-        if not file_path or file_path == ".":
-            return f"Error: Invalid file path - {file_path}"
+    async def analyze_targets_async(self, args: Dict[str, Any]) -> str:
+        tasks = []
+        if args.get("files"):
+            for file_path in args["files"]:
+                path = Path(file_path).resolve()
+                if path.is_file():
+                    tasks.append(self.process_file_async(path, args))
+                else:
+                    tasks.append(
+                        asyncio.to_thread(lambda: f"Error: Invalid file path - {path}")
+                    )
 
-        if not os.path.exists(file_path):
-            return f"Error: File not found - {file_path}"
+        if args.get("directory"):
+            dir_path = Path(args["directory"]).resolve()
+            if dir_path.is_dir():
+                tasks.append(self.process_directory_async(dir_path, args))
+            else:
+                tasks.append(
+                    asyncio.to_thread(
+                        lambda: f"Error: Invalid directory path - {dir_path}"
+                    )
+                )
+
+        results = await asyncio.gather(*tasks)
+        return "\n\n".join(filter(None, results))
+
+    def process_file(self, file_path: Path, args: Dict[str, Any]) -> str:
+        if not self._should_analyze_file(file_path, args):
+            return None
 
         try:
-            with open(file_path, "r", encoding="utf-8") as file:
+            with file_path.open("r", encoding="utf-8") as file:
                 content = file.read()
 
-            file_result = f"Analysis for {file_path}:\n"
+            result = f"Analysis for {file_path}:\n"
+            result += f"  File size: {file_path.stat().st_size} bytes\n"
+            result += f"  Last modified: {file_path.stat().st_mtime}\n"
 
             if args.get("count"):
-                count_result = self.count_elements(content, args["count"])
-                file_result += f"  {args['count'].capitalize()}: {count_result}\n"
+                result += self.count_elements(content, args["count"])
+            elif args.get("search"):
+                result += self.search_content(content, args["search"])
+            elif args.get("replace"):
+                result += self.replace_content(file_path, content, args["replace"])
+            else:
+                result += self.default_analysis(content)
 
-            if args.get("search"):
-                search_result = self.search_term(content, args["search"])
-                file_result += f"  Occurrences of '{args['search']}': {search_result}\n"
-
-            if args.get("replace"):
-                if isinstance(args["replace"], list) and len(args["replace"]) == 2:
-                    search_term, replace_term = args["replace"]
-                    replaced_content, count = self.replace_term(content, search_term, replace_term)
-                    file_result += f"  Replaced {count} occurrence(s) of '{search_term}' with '{replace_term}'\n"
-
-                    with open(file_path, "w", encoding="utf-8") as file:
-                        file.write(replaced_content)
-                else:
-                    file_result += "  Error: Invalid replace arguments\n"
-
-            return file_result
-
-        except PermissionError:
-            return f"Error: Permission denied - {file_path}"
+            return result
+        except Exception as e:
+            return f"Error processing {file_path}: {str(e)}"
         except Exception as e:
             return f"Error processing {file_path}: {str(e)}"
 
-    def count_elements(self, content: str, element: str) -> int:
+    def process_directory(self, dir_path: Path, args: Dict[str, Any]) -> List[str]:
+        results = []
+        if args.get("recursive"):
+            for root, _, files in os.walk(dir_path):
+                for file in files:
+                    file_path = Path(root) / file
+                    if self._should_analyze_file(file_path, args):
+                        results.append(self.process_file(file_path, args))
+        else:
+            results.append(f"Contents of {dir_path}:")
+            for item in dir_path.iterdir():
+                if item.is_file() and self._should_analyze_file(item, args):
+                    results.append(f"  {item.name}")
+        return list(filter(None, results))
+
+    async def process_file_async(self, file_path: Path, args: Dict[str, Any]) -> str:
+        return await asyncio.to_thread(self.process_file, file_path, args)
+
+    async def process_directory_async(
+        self, dir_path: Path, args: Dict[str, Any]
+    ) -> List[str]:
+        return await asyncio.to_thread(self.process_directory, dir_path, args)
+
+    def count_elements(self, content: str, element: str) -> str:
         if element == "words":
-            return len(content.split())
+            count = len(content.split())
+            return f"  Word count: {count}"
         elif element == "lines":
-            return len(content.splitlines())
+            count = len(content.splitlines())
+            return f"  Line count: {count}"
         elif element == "chars":
-            return len(content)
+            count = len(content)
+            return f"  Character count: {count}"
 
-    def search_term(self, content: str, term: str) -> int:
-        return len(re.findall(re.escape(term), content, re.IGNORECASE))
+    def search_content(self, content: str, term: str) -> str:
+        matches = list(re.finditer(term, content, re.MULTILINE))
+        if matches:
+            results = [
+                f"  Line {content.count(chr(10), 0, m.start()) + 1}: {m.group()}"
+                for m in matches
+            ]
+            return f"Occurrences of '{term}':\n" + "\n".join(results)
+        return f"No matches found for '{term}'"
 
-    def replace_term(self, content: str, search: str, replace: str) -> tuple[str, int]:
-        pattern = re.compile(re.escape(search), re.IGNORECASE)
-        new_content, count = pattern.subn(replace, content)
-        return new_content, count
+    def replace_content(
+        self, file_path: Path, content: str, replace_args: List[str]
+    ) -> str:
+        search, replace = replace_args
+        new_content, count = re.subn(search, replace, content, flags=re.MULTILINE)
+        if count > 0:
+            with file_path.open("w", encoding="utf-8") as file:
+                file.write(new_content)
+            return f"Replaced {count} occurrence(s) of '{search}' with '{replace}'"
+        return f"No replacements made for '{search}'"
+
+    def default_analysis(self, content: str) -> str:
+        words = len(content.split())
+        lines = len(content.splitlines())
+        chars = len(content)
+        return f"  Words: {words}\n  Lines: {lines}\n  Characters: {chars}"
 
     def cleanup(self):
         self.log("Cleaning up FileAnalyzerPlugin", "verbose")
@@ -131,5 +247,21 @@ class FileAnalyzerPlugin(Plugin):
             return
         if level == "verbose" and not self.verbose:
             return
-        color_method = getattr(self.context.colored_output, level, self.context.colored_output.blue)
-        self.context.logger.log(color_method(f"[{self.metadata.name}] {message}"), level.upper())
+        color_method = getattr(
+            self.context.colored_output, level, self.context.colored_output.blue
+        )
+        self.context.logger.log(
+            color_method(f"[{self.metadata.name}] {message}"), level.upper()
+        )
+
+    def _should_analyze_file(self, file_path: Path, args: Dict[str, Any]) -> bool:
+        if args.get("file_type") and not str(file_path).lower().endswith(
+            args["file_type"].lower()
+        ):
+            return False
+        if args.get("size_limit") and file_path.stat().st_size > args["size_limit"]:
+            return False
+        return True
+
+    def get_system_info(self) -> str:
+        return f"Running on {platform.system()} {platform.release()} ({platform.machine()})"
